@@ -126,7 +126,7 @@ TRUST_POLICY=$(cat <<EOF
     {
       "Effect": "Allow",
       "Principal": { "Federated": "${OIDC_ARN}" },
-      "Action": "sts:AssumeRoleWithWebIdentity",
+      "Action": ["sts:AssumeRoleWithWebIdentity", "sts:TagSession"],
       "Condition": {
         "StringEquals": {
           "${OIDC_URL}:aud": "sts.amazonaws.com"
