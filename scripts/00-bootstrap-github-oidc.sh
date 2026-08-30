@@ -66,6 +66,18 @@ ROLE_NAME="${PROJECT}-github-actions-infra-role"
 POLICY_NAME="${PROJECT}-github-actions-infra-policy"
 POLICY_ARN="arn:aws:iam::${ACCOUNT_ID}:policy/${POLICY_NAME}"
 
+
+# GitHub issues "immutable" subject claims with numeric IDs appended:
+#   repo:owner@<ownerId>/repo@<repoId>:pull_request
+# Names can be renamed and re-registered by someone else; the IDs never change,
+# so binding to them means the trust cannot be hijacked via a repo rename.
+OWNER_ID=$(curl -sS "https://api.github.com/users/${GITHUB_ORG}" \
+  | python3 -c "import sys,json;print(json.load(sys.stdin)['id'])")
+REPO_ID=$(curl -sS "https://api.github.com/repos/${GITHUB_ORG}/${INFRA_REPO}" \
+  | python3 -c "import sys,json;print(json.load(sys.stdin)['id'])")
+info "Owner ID: $OWNER_ID   Repo ID: $REPO_ID"
+
+
 echo ""
 echo "  ----- Configuration Summary -----"
 echo "  AWS Account  : $ACCOUNT_ID"
