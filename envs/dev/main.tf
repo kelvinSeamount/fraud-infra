@@ -48,6 +48,25 @@ module "eks" {
   cluster_log_retention_days = 7
 }
 
+# The cluster is created by GitHub Actions, so the CI role gets admin
+# automatically. Without this, your laptop cannot reach the cluster at all —
+# kubectl fails with "You must be logged in to the server".
+resource "aws_eks_access_entry" "local_admin" {
+  cluster_name  = module.eks.cluster_name
+  principal_arn = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:user/Fraud.ci"
+  type          = "STANDARD"
+}
+
+resource "aws_eks_access_policy_association" "local_admin" {
+  cluster_name  = module.eks.cluster_name
+  principal_arn = aws_eks_access_entry.local_admin.principal_arn
+  policy_arn    = "arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy"
+
+  access_scope {
+    type = "cluster"
+  }
+}
+
 module "s3" {
   source = "../../modules/s3"
 
