@@ -130,12 +130,12 @@ ArgoCD and ArgoCD reverts Terraform.
 
 ## 2. Design Decisions
 
-Every deliberate difference from the `Infra-Zen` pattern this repo is based on,
-and the reasoning behind it.
+The choices in this repo that are not the default, and why each was made.
 
 ### Split node groups, with the memory pool tainted
 
-Infra-Zen runs a single node group. This runs two.
+The obvious layout is one node group for everything. This runs two, because
+one pool cannot safely hold both halves of this workload.
 
 **The problem it solves:** Elasticsearch and Kafka are memory-hungry and bursty.
 Sharing a pool with the scoring service means a JVM heap spike or a Kafka
@@ -160,11 +160,11 @@ memory-optimised, which is exactly what ES and Kafka want. Root volumes are
 
 ### GitHub OIDC instead of static AWS keys
 
-Infra-Zen's Terraform pipeline used `AWS_ACCESS_KEY_ID` /
-`AWS_SECRET_ACCESS_KEY` stored as repo secrets — long-lived credentials sitting
-in GitHub indefinitely.
+The common approach is to generate an IAM user's access key and paste it into
+repository secrets. That works on day one and leaves a long-lived credential
+sitting in GitHub indefinitely, valid until someone remembers to rotate it.
 
-Here the pipeline federates: GitHub mints a short-lived signed token per run,
+Here the pipeline federates instead: GitHub mints a short-lived signed token per run,
 AWS validates it against a registered identity provider and the role's trust
 policy, and returns credentials that **expire in one hour**. No long-lived AWS
 credential exists in any repo.
@@ -174,7 +174,8 @@ and is the reason the app repos and the infra repo now authenticate the same way
 
 ### Immutable ECR tags
 
-Changed from Infra-Zen's `MUTABLE`.
+ECR defaults to mutable tags, which is convenient for ordinary app deploys — you
+push `:latest` and it overwrites. That convenience is wrong here.
 
 The retraining loop promotes a model by committing an image tag into
 `fraud-gitops`. If that tag could be overwritten, the commit would stop pointing
@@ -186,15 +187,15 @@ SHA, never `:latest`.
 
 ### `TF_VAR_*` instead of `-var` flags
 
-Infra-Zen passes secrets as `-var="db_password=..."` on the command line.
+The usual pattern is `terraform plan -var="db_password=..."`.
 Command-line arguments are visible in the process table and can surface in
 debug output. Environment variables are the safer channel, and Terraform reads
 `TF_VAR_x` into `var.x` automatically.
 
 ### No Kubernetes provider in Terraform
 
-Infra-Zen declares one. This repo does not, because it creates zero Kubernetes
-resources. Declaring a provider that authenticates to a cluster which does not
+Terraform configurations that touch EKS commonly declare one. This repo does
+not, because it creates zero Kubernetes resources. Declaring a provider that authenticates to a cluster which does not
 exist yet is how you get `Provider produced inconsistent result` on a fresh
 apply. Dropping it is both a cleaner boundary statement and avoids the bug.
 
@@ -214,16 +215,21 @@ One word, environment-appropriate safety.
 
 ### Data-tier subnets, not "RDS subnets"
 
-Infra-Zen names them `private_rds_*`. By Phase 2 this tier may also hold
-ElastiCache, so naming it after its first tenant would become a lie. It carries
+The natural name is `private_rds_*`, after the first thing that lands there. By
+Phase 2 this tier may also hold ElastiCache, so naming it after its first tenant would become a lie. It carries
 no `kubernetes.io/*` tags, which is what structurally prevents EKS from ever
 placing a node or ENI there.
 
 ### ArgoCD installs the platform, not shell scripts
 
-Infra-Zen has four scripts that install NGINX Ingress, ArgoCD, ESO and
-metrics-server. Here two scripts install **only** ArgoCD and ESO; everything
-else is an ArgoCD Application in `fraud-gitops`.
+The straightforward approach is a set of shell scripts that Helm-install every
+component: ingress controller, ArgoCD, secrets operator, metrics server, and so
+on. It works, but the scripts become the source of truth and drift from what is
+actually running.
+
+Here two scripts install **only** ArgoCD and External Secrets Operator — the two
+things that must exist before GitOps can take over. Everything else is an ArgoCD
+Application in `fraud-gitops`, installed and continuously self-healed.
 
 Adding Kafka in Phase 2 becomes a Git commit rather than a script edit.
 

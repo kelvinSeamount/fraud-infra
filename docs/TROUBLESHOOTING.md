@@ -359,8 +359,8 @@ aws s3 rm s3://<state-bucket>/envs/dev/terraform.tfstate.tflock
 Only remove a lock when you are certain no run is active. Deleting a live lock
 while a job writes state is how state files get corrupted.
 
-**Note:** Infra-Zen carries the same latent bug — its plan job has no `if`
-either.
+**Note:** this is easy to miss. A plan job with no `if` condition looks harmless
+for months — it only bites the first time you dispatch a destroy.
 
 ---
 
