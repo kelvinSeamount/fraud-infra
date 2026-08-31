@@ -96,7 +96,7 @@ prompt AWS_REGION \
   "eu-central-1" "eu-central-1"
 
 prompt AWS_ACCOUNT_ID \
-  "AWS account ID (12 digits — 'terraform output aws_account_id')" \
+  "AWS account ID (12 digits, NO dashes — the console shows it as 8662-5908-4078)" \
   "123456789012" ""
 
 DEFAULT_ESO_ROLE_NAME="fraud-${ENV}-eso-role"
@@ -104,6 +104,11 @@ prompt ESO_ROLE_NAME \
   "ESO IAM role name ('terraform output eso_role_name')" \
   "fraud-dev-eso-role" "$DEFAULT_ESO_ROLE_NAME"
 
+# The AWS console displays the account ID with dashes for readability. Pasting
+# that produces an unusable ARN and ESO fails to assume the role with a
+# misleading error. Strip anything that is not a digit, then insist on 12.
+AWS_ACCOUNT_ID="${AWS_ACCOUNT_ID//[^0-9]/}"
+[[ "$AWS_ACCOUNT_ID" =~ ^[0-9]{12}$ ]] || die "AWS account ID must be 12 digits. Got: '$AWS_ACCOUNT_ID'"
 ESO_ROLE_ARN="arn:aws:iam::${AWS_ACCOUNT_ID}:role/${ESO_ROLE_NAME}"
 
 echo ""
@@ -130,14 +135,24 @@ echo "--------------------------------------------"
 echo "  Pre-flight: node pools"
 echo "--------------------------------------------"
 
-GENERAL_NODES=$(kubectl get nodes -l workload=general --no-headers 2>/dev/null | grep -c " Ready " || echo 0)
-MEMORY_NODES=$(kubectl get nodes -l workload=memory  --no-headers 2>/dev/null | grep -c " Ready " || echo 0)
+# grep -c prints 0 AND exits 1 when there are no matches, so '|| echo 0' would
+# produce the string "0\n0" and break the numeric tests below. Use '|| true'.
+GENERAL_NODES=$(kubectl get nodes -l workload=general --no-headers 2>/dev/null | grep -c " Ready " || true)
+MEMORY_NODES=$(kubectl get nodes -l workload=memory  --no-headers 2>/dev/null | grep -c " Ready " || true)
+GENERAL_NODES=${GENERAL_NODES:-0}
+MEMORY_NODES=${MEMORY_NODES:-0}
 
 info "General pool  : $GENERAL_NODES Ready"
 info "Memory pool   : $MEMORY_NODES Ready"
 
-[[ "$GENERAL_NODES" -lt 1 ]] && die "No Ready nodes in the general pool. Check the node group in the EKS console."
-[[ "$MEMORY_NODES"  -lt 1 ]] && warn "No Ready nodes in the memory pool — Elasticsearch and Kafka will stay Pending later."
+# Written as 'if' blocks, not '[[ ]] && cmd'. Under 'set -e' a false '&&' list
+# returns 1 and kills the script — the warning below would abort the run.
+if [[ "$GENERAL_NODES" -lt 1 ]]; then
+  die "No Ready nodes in the general pool. Check the node group in the EKS console."
+fi
+if [[ "$MEMORY_NODES" -lt 1 ]]; then
+  warn "No Ready nodes in the memory pool — Elasticsearch and Kafka will stay Pending later."
+fi
 
 kubectl get nodes -L workload,node.kubernetes.io/instance-type
 log "Node pools verified."
@@ -160,6 +175,14 @@ log "Helm repositories updated."
 #
 # The only job here is getting ArgoCD running. Script 02 then hands it ONE root
 # Application and ArgoCD discovers the rest of the platform from Git.
+#
+# TLS: left at the ArgoCD default, matching Infra-Zen. ArgoCD self-signs and
+# serves HTTPS end to end, so the browser shows a certificate warning you click
+# through. The alternative — configs.params.server.insecure=true — makes ArgoCD
+# serve plain HTTP, which is only correct when an ALB ingress in front is
+# terminating TLS with a real ACM certificate. No such ingress exists yet, so
+# that flag would state something untrue about this cluster. Turn it on in
+# Phase 4 when the ALB is actually built.
 # =============================================================================
 echo ""
 echo "--------------------------------------------"
@@ -169,7 +192,6 @@ echo "--------------------------------------------"
 helm upgrade --install argocd argo/argo-cd \
   --namespace argocd \
   --create-namespace \
-  --set configs.params."server\.insecure"=true \
   --set controller.resources.requests.cpu=250m \
   --set controller.resources.requests.memory=512Mi \
   --wait --timeout 10m
@@ -190,6 +212,12 @@ echo ""
 echo "  Access the UI:"
 echo "    kubectl port-forward svc/argocd-server -n argocd 8080:443"
 echo "    open https://localhost:8080"
+echo ""
+echo "  The browser will warn that the certificate is not trusted."
+echo "  Click Advanced -> Proceed. ArgoCD signs its own certificate on a"
+echo "  dev cluster; that warning is expected, not a fault."
+echo "  Confirm the mode any time with:"
+echo "    kubectl logs -n argocd deploy/argocd-server | grep 'tls:'"
 echo "  ============================================================"
 echo ""
 
@@ -200,6 +228,10 @@ echo ""
 # the entire authentication story: ESO's pod gets a projected token, exchanges
 # it for the role, and reads /fraud/* from Secrets Manager. No AWS keys exist
 # anywhere in this cluster.
+#
+# The CRD flag is 'crds.enabled' in chart 2.x. The old 'installCRDs' name is
+# silently ignored by Helm rather than erroring, so a stale flag looks fine
+# right up until a CRD turns out to be missing.
 # =============================================================================
 echo ""
 echo "--------------------------------------------"
@@ -209,11 +241,20 @@ echo "--------------------------------------------"
 helm upgrade --install external-secrets external-secrets/external-secrets \
   --namespace external-secrets \
   --create-namespace \
-  --set installCRDs=true \
+  --set crds.enabled=true \
   --set serviceAccount.annotations."eks\.amazonaws\.com/role-arn"="$ESO_ROLE_ARN" \
   --wait --timeout 5m
 
 log "External Secrets Operator installed with IRSA role $ESO_ROLE_ARN"
+
+# Prove the annotation actually landed. A typo in the account ID produces an
+# ARN that looks plausible but can never be assumed.
+ANNOTATED_ARN=$(kubectl get sa external-secrets -n external-secrets \
+  -o jsonpath='{.metadata.annotations.eks\.amazonaws\.com/role-arn}' 2>/dev/null || echo "")
+if [[ "$ANNOTATED_ARN" != "$ESO_ROLE_ARN" ]]; then
+  die "ServiceAccount annotation is '$ANNOTATED_ARN', expected '$ESO_ROLE_ARN'."
+fi
+log "ServiceAccount annotation verified: $ANNOTATED_ARN"
 
 # Restart so the pod definitely picks up the SA annotation. On a first install
 # this is a no-op; on a re-run with a changed ARN it is essential.
@@ -226,14 +267,23 @@ kubectl -n external-secrets rollout status  deployment external-secrets --timeou
 # A ClusterSecretStore (not a namespaced SecretStore) because secrets are
 # consumed across many namespaces: monitoring (Grafana), mlflow, kafka, argo.
 # One store, many namespaces, one IAM role.
+#
+# API VERSION: external-secrets.io/v1. ESO 2.x stopped serving v1beta1 — the
+# CRD still lists it with served=false, which is why kubectl reports
+# "no matches for kind" rather than "CRD not found". Confirm what is actually
+# served with:  kubectl api-resources --api-group=external-secrets.io
 # =============================================================================
 echo ""
 echo "--------------------------------------------"
 echo "  Step 4 of 4: ClusterSecretStore"
 echo "--------------------------------------------"
 
+kubectl api-resources --api-group=external-secrets.io 2>/dev/null \
+  | grep -q "ClusterSecretStore" \
+  || die "ClusterSecretStore CRD is not present. Re-run Step 3 with --set crds.enabled=true"
+
 cat <<EOF | kubectl apply -f -
-apiVersion: external-secrets.io/v1beta1
+apiVersion: external-secrets.io/v1
 kind: ClusterSecretStore
 metadata:
   name: aws-secrets-manager
@@ -252,7 +302,7 @@ EOF
 log "ClusterSecretStore 'aws-secrets-manager' created."
 
 info "Waiting for the store to validate against AWS..."
-sleep 10
+sleep 15
 STORE_STATUS=$(kubectl get clustersecretstore aws-secrets-manager \
   -o jsonpath='{.status.conditions[0].reason}' 2>/dev/null || echo "Unknown")
 
@@ -261,8 +311,13 @@ if [[ "$STORE_STATUS" == "Valid" ]]; then
 else
   warn "ClusterSecretStore status: $STORE_STATUS"
   warn "Check with: kubectl describe clustersecretstore aws-secrets-manager"
-  warn "Most common cause: the IAM role trust policy does not match"
-  warn "  system:serviceaccount:external-secrets:external-secrets"
+  warn "Most common causes:"
+  warn "  1. Account ID typo in the role ARN (console shows it with dashes)"
+  warn "  2. IAM role trust policy does not match"
+  warn "     system:serviceaccount:external-secrets:external-secrets"
+  warn "  Compare with:"
+  warn "     aws iam get-role --role-name $ESO_ROLE_NAME \\"
+  warn "       --query 'Role.AssumeRolePolicyDocument'"
 fi
 
 echo ""
@@ -283,5 +338,7 @@ echo "  Nothing else was installed imperatively — by design."
 echo "  ArgoCD takes over from here."
 echo ""
 echo "  ArgoCD admin password : $ARGOCD_PASSWORD"
+echo "  ArgoCD UI             : kubectl port-forward svc/argocd-server -n argocd 8080:443"
+echo "                          then open https://localhost:8080"
 echo ""
 echo "Next step: ./scripts/02-register-gitops.sh"
