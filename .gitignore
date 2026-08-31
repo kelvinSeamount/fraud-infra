@@ -41,3 +41,6 @@ Thumbs.db
 # IDE
 .idea/
 .vscode/
+
+# Local working notes — not part of the repo
+HANDOFF.md
