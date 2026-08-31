@@ -3,7 +3,7 @@
 Every error hit while standing up `fraud-infra`, what actually caused it, and
 the fix.
 
-Nine were real; one was a red herring. Read the red herring first so you don't
+Twelve were real; one was a red herring. Read the red herring first so you don't
 chase it.
 
 ---
@@ -364,6 +364,239 @@ for months — it only bites the first time you dispatch a destroy.
 
 ---
 
+## 10. `no matches for kind "ClusterSecretStore"` — Step B, script 01
+
+**Symptom:**
+
+```
+error: resource mapping not found for name: "aws-secrets-manager" namespace: ""
+from "STDIN": no matches for kind "ClusterSecretStore" in version
+"external-secrets.io/v1beta1"
+ensure CRDs are installed first
+```
+
+**The misleading part:** "ensure CRDs are installed first" sends you off to
+reinstall External Secrets. The CRDs were installed and fine — all twenty-five
+of them.
+
+**Cause:** the script asked for API version `external-secrets.io/v1beta1`. The
+chart installed was External Secrets **2.10.0**, which promoted the API to `v1`
+and stopped serving the beta. The CRD still *lists* `v1beta1` as a historical
+entry, but with `served: false` — which is exactly why the error says "no
+matches for kind" rather than "CRD not found".
+
+**The command that ends the guessing:**
+
+```bash
+kubectl api-resources --api-group=external-secrets.io
+```
+
+```
+NAME                  SHORTNAMES   APIVERSION               NAMESPACED   KIND
+clustersecretstores   css          external-secrets.io/v1   false        ClusterSecretStore
+externalsecrets       es           external-secrets.io/v1   true         ExternalSecret
+secretstores          ss           external-secrets.io/v1   true         SecretStore
+```
+
+Only `v1`. To see what a CRD serves versus merely remembers:
+
+```bash
+kubectl get crd clustersecretstores.external-secrets.io \
+  -o jsonpath='{range .spec.versions[*]}{.name}{" served="}{.served}{"\n"}{end}'
+```
+
+```
+v1        served=true
+v1beta1   served=false
+```
+
+**Fix:** one word in `scripts/01-bootstrap-argocd-eso.sh`:
+
+```yaml
+apiVersion: external-secrets.io/v1
+```
+
+**Root cause behind the root cause:** the chart version was unpinned. The script
+was written against ESO 0.x and the chart floated forward underneath it. A guard
+now runs before the manifest is applied:
+
+```bash
+kubectl api-resources --api-group=external-secrets.io 2>/dev/null \
+  | grep -q "ClusterSecretStore" \
+  || die "ClusterSecretStore CRD is not present. Re-run Step 3 with --set crds.enabled=true"
+```
+
+**Related, found at the same time:** the chart also renamed `installCRDs` to
+`crds.enabled` in 2.x. Helm **silently ignores** values it does not recognise —
+no warning, no error — so `--set installCRDs=true` had been doing nothing. It
+happened to work because the chart installs CRDs by default. That is luck, not
+configuration.
+
+---
+
+## 11. ESO ServiceAccount holding an unusable role ARN
+
+**Symptom:** none, initially. Nothing failed loudly. It would have surfaced as a
+permanently `Invalid` ClusterSecretStore and sent us hunting the IAM trust
+policy.
+
+**Found with:**
+
+```bash
+kubectl get sa external-secrets -n external-secrets \
+  -o jsonpath='{.metadata.annotations.eks\.amazonaws\.com/role-arn}'
+```
+
+```
+arn:aws:iam::8662-5908-4078:role/fraud-dev-eso-role
+```
+
+**Cause:** the AWS console *displays* the account ID as `8662-5908-4078`. The
+dashes are formatting, like the spaces in a credit card number. That string was
+pasted into the script's prompt. AWS does not accept it — the ARN points at an
+account that does not exist.
+
+The correct value is always twelve bare digits:
+
+```bash
+aws sts get-caller-identity --query Account --output text
+# 866259084078
+```
+
+**Fix — re-annotate and restart:**
+
+```bash
+kubectl annotate serviceaccount external-secrets -n external-secrets \
+  eks.amazonaws.com/role-arn=arn:aws:iam::866259084078:role/fraud-dev-eso-role \
+  --overwrite
+
+kubectl rollout restart deployment external-secrets -n external-secrets
+kubectl rollout status  deployment external-secrets -n external-secrets
+```
+
+The restart is mandatory. The pod reads its annotation once, at startup.
+
+**Prevention — added to script 01, before the ARN is built:**
+
+```bash
+AWS_ACCOUNT_ID="${AWS_ACCOUNT_ID//[^0-9]/}"
+[[ "$AWS_ACCOUNT_ID" =~ ^[0-9]{12}$ ]] || die "AWS account ID must be 12 digits. Got: '$AWS_ACCOUNT_ID'"
+```
+
+The first line discards every non-digit, so a pasted `8662-5908-4078` silently
+becomes correct. The second refuses to continue if what remains is not twelve
+digits.
+
+And a check *after* the Helm install, so a bad ARN fails in one second rather
+than one hour:
+
+```bash
+ANNOTATED_ARN=$(kubectl get sa external-secrets -n external-secrets \
+  -o jsonpath='{.metadata.annotations.eks\.amazonaws\.com/role-arn}' 2>/dev/null || echo "")
+if [[ "$ANNOTATED_ARN" != "$ESO_ROLE_ARN" ]]; then
+  die "ServiceAccount annotation is '$ANNOTATED_ARN', expected '$ESO_ROLE_ARN'."
+fi
+```
+
+**Lesson:** an IRSA failure is not always the trust policy. Check the annotation
+the pod is actually holding before touching IAM. The trust policy here was
+correct the entire time.
+
+---
+
+## 12. ArgoCD port-forward — `connection reset by peer`
+
+**Symptom:**
+
+```
+Forwarding from 127.0.0.1:8080 -> 8080
+Handling connection for 8080
+E0831 22:16:24 "Unhandled Error" err="an error occurred forwarding 8080 -> 8080:
+  ... read: connection reset by peer"
+error: lost connection to pod
+```
+
+**Cause:** the browser was opening `https://localhost:8080`. The script had
+installed ArgoCD with:
+
+```bash
+--set configs.params."server\.insecure"=true
+```
+
+That flag turns ArgoCD's own TLS **off** — it serves plain HTTP on 8080. A
+browser sending an encrypted handshake to a plaintext listener gets the
+connection dropped. Nothing was broken; two ends were speaking different
+protocols.
+
+**Two clues that were there all along:**
+
+1. The forward reported `-> 8080`, never `-> 443`. Both service ports target
+   the same container port:
+
+   ```
+   http   port=80   targetPort=8080
+   https  port=443  targetPort=8080
+   ```
+
+   So `8080:443` and `8080:80` are identical. That was never the variable —
+   both were tried repeatedly, and both failed for the same reason.
+
+2. ArgoCD says which mode it is in, in its first ten log lines:
+
+   ```bash
+   kubectl logs -n argocd deploy/argocd-server | grep "tls:"
+   ```
+
+   ```
+   argocd v3.5.2 serving on port 8080 (url: https://argocd.example.com, tls: false, ...)
+   ```
+
+   `tls: false` settles it in two seconds.
+
+**Confirming without a browser** — takes the browser's opinions out of the
+picture:
+
+```bash
+curl -I http://localhost:8080     # HTTP/1.1 200 OK
+curl -I https://localhost:8080    # curl: (35) SSL routines ... alert protocol version
+```
+
+**Compounding problem — the browser cached the wrong scheme.**
+`https://localhost:8080` had been used for months on the Infra-Zen project.
+Chrome remembered "localhost:8080 means https" and silently upgraded `http` back
+to `https`, so typing the correct URL still failed.
+
+Workarounds, in order of preference:
+
+1. Use `http://127.0.0.1:8080` — a different hostname, with no cached note
+   against it. `localhost` also resolves to both `127.0.0.1` and `::1`, adding a
+   second source of ambiguity.
+2. `chrome://net-internals/#hsts` -> **Delete domain security policies** ->
+   `localhost`.
+3. `chrome://settings/security` -> turn off **Always use secure connections**.
+
+**Resolution — the flag was removed entirely.** `server.insecure=true` is a
+statement that *something in front of ArgoCD is terminating TLS*. No ingress
+exists in this cluster, so the flag asserted something untrue. ArgoCD now runs at
+its default: it self-signs and serves HTTPS end to end, matching Infra-Zen.
+
+| Option | Encryption | Access | Verdict |
+|---|---|---|---|
+| ALB + ACM cert + Route53 | Real, trusted | `https://argocd.fraud-dev.piroo.online` | The target — Phase 4 |
+| ArgoCD default, self-signed | Real, untrusted cert | `https://localhost:8080` + click through | **Chosen for Phase 0** |
+| `server.insecure=true`, no ingress | None at ArgoCD | `http://127.0.0.1:8080` | Rejected — claims a proxy that does not exist |
+
+Over `port-forward` the practical security difference between the last two is
+near zero, because the tunnel is already encrypted by the Kubernetes API. The
+reason to prefer the default is that the configuration stops describing
+infrastructure that was never built. Turn the flag back on in Phase 4, when the
+ALB is real.
+
+**Note:** `scripts/03-verify-platform.sh` already printed `8080:443`. Script 01
+was the only file in the repo out of step with the rest.
+
+---
+
 ## Still outstanding
 
 `fraud-github-actions-app-role` (used by `fraud-backend-CI`) was created by
@@ -396,7 +629,18 @@ It will fail exactly as sections 3–5 did. Two fixes needed before Part 3:
 4. **kubectl refused?** `aws eks list-access-entries`.
 5. **State lock?** Check `Operation:` in the lock info — it names the culprit.
 6. **UI element missing?** Check the default branch and clear any filter.
+7. **"No matches for kind"?** `kubectl api-resources --api-group=<group>`. The
+   CRD is usually present; the API version moved.
+8. **IRSA not working?** Read the ServiceAccount annotation before touching IAM.
+9. **Connection reset on port-forward?** `curl -I http://...` first. If curl
+   works, the problem is the browser, not the cluster.
 
 The recurring theme: **one generic error message can have several unrelated
-causes.** Get the actual data — CloudTrail, access entries, lock info — before
-changing anything.
+causes.** Get the actual data — CloudTrail, access entries, lock info,
+`api-resources`, the pod's own startup log — before changing anything.
+
+A second theme, new in sections 10–12: **the component will tell you its own
+state if you ask it.** `api-resources` names the served API version. The
+ServiceAccount shows the ARN it holds. `argocd-server` prints `tls:` in its
+first ten log lines. Three of tonight's errors were each two seconds of reading
+away.
