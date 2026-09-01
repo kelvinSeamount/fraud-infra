@@ -278,9 +278,10 @@ echo "--------------------------------------------"
 echo "  Step 4 of 4: ClusterSecretStore"
 echo "--------------------------------------------"
 
-kubectl api-resources --api-group=external-secrets.io 2>/dev/null \
-  | grep -q "ClusterSecretStore" \
-  || die "ClusterSecretStore CRD is not present. Re-run Step 3 with --set crds.enabled=true"
+# Wait for the CRD to be registered AND established before using it.
+kubectl wait --for=condition=established --timeout=120s \
+  crd/clustersecretstores.external-secrets.io \
+  || die "ClusterSecretStore CRD never became established. Inspect with: kubectl get crd | grep external-secrets"
 
 cat <<EOF | kubectl apply -f -
 apiVersion: external-secrets.io/v1

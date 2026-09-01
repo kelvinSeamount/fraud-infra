@@ -3,7 +3,7 @@
 Every error hit while standing up `fraud-infra`, what actually caused it, and
 the fix.
 
-Twelve were real; one was a red herring. Read the red herring first so you don't
+Fourteen were real; one was a red herring. Read the red herring first so you don't
 chase it.
 
 ---
@@ -597,6 +597,196 @@ was the only file in the repo out of step with the rest.
 
 ---
 
+## 13. `ClusterSecretStore CRD is not present` — the guard from §10 misfiring
+
+**Symptom:** on a freshly rebuilt cluster, 2026-09-01, script 01 died at Step 4
+seconds after External Secrets installed cleanly:
+
+```
+[19:29:53] OK  External Secrets Operator installed with IRSA role arn:aws:iam::866259084078:role/fraud-dev-eso-role
+[19:29:54] OK  ServiceAccount annotation verified: arn:aws:iam::866259084078:role/fraud-dev-eso-role
+deployment "external-secrets" successfully rolled out
+
+--------------------------------------------
+  Step 4 of 4: ClusterSecretStore
+--------------------------------------------
+[19:29:56] ERR ClusterSecretStore CRD is not present. Re-run Step 3 with --set crds.enabled=true
+```
+
+**The CRD was not missing.** All twenty-five were present and healthy:
+
+```bash
+kubectl get crd | grep -c external-secrets.io
+# 25
+
+kubectl api-resources --api-group=external-secrets.io
+# clustersecretstores   css   external-secrets.io/v1   false   ClusterSecretStore
+```
+
+**Cause: `kubectl`'s discovery cache was stale.**
+
+`kubectl` does not ask the cluster "what can you do?" on every command. It reads
+a cached answer from `~/.kube/cache/discovery/<cluster-endpoint>/`. That cache
+is per-cluster, keyed on the API endpoint hostname.
+
+On this run the sequence was:
+
+| Time | What happened |
+|---|---|
+| 19:29 (early) | Pre-flight `kubectl get nodes` etc. — cache written **without** External Secrets, because ESO did not exist yet |
+| 19:29:53 | Helm installs ESO and its 25 CRDs |
+| 19:29:56 | The guard runs `kubectl api-resources` — reads the cache from 90 seconds ago, sees no ClusterSecretStore, dies |
+| 19:31 | Cache refreshed on a later command; everything then worked |
+
+The timestamps are visible on disk:
+
+```bash
+ls -la ~/.kube/cache/discovery/<endpoint>/
+# external-secrets.io/     created  Sep 1 19:29
+# servergroups.json        written  Sep 1 19:31   <- two minutes AFTER the failure
+```
+
+`servergroups.json` is the master list of API groups. At 19:29:56 it was the
+version written during pre-flight and did not list `external-secrets.io` at all.
+
+**Why it had never happened before.** Three things had to coincide, and
+2026-09-01 was the first time they did:
+
+1. **The guard was new.** It was added on 2026-08-31 to make §10's error
+   clearer. This was its first ever execution.
+2. **The 2026-08-31 re-run had a warm cache.** ESO was installed at 22:14 during
+   the first run that night. By the time the script was re-run, the cache
+   already knew about it — the guard would have passed even if it had existed.
+3. **A rebuilt cluster gets a brand-new cache directory.** New EKS endpoint →
+   new hostname → new empty folder with no history. The cache was built from
+   scratch during pre-flight, minutes before ESO existed.
+
+New guard + fresh cluster + CRDs installed in the same run. Any two of the three
+and it passes.
+
+**Immediate fix — the script died at the last step, so Steps 1–3 had all
+succeeded.** Only the store itself was missing:
+
+```bash
+kubectl apply -f - <<'EOF'
+apiVersion: external-secrets.io/v1
+kind: ClusterSecretStore
+metadata:
+  name: aws-secrets-manager
+spec:
+  provider:
+    aws:
+      service: SecretsManager
+      region: eu-central-1
+      auth:
+        jwt:
+          serviceAccountRef:
+            name: external-secrets
+            namespace: external-secrets
+EOF
+
+kubectl get clustersecretstore aws-secrets-manager
+# aws-secrets-manager   51s   Valid   ReadWrite   True
+```
+
+**Permanent fix — replace the guard in `scripts/01-bootstrap-argocd-eso.sh`.**
+
+Before:
+
+```bash
+kubectl api-resources --api-group=external-secrets.io 2>/dev/null \
+  | grep -q "ClusterSecretStore" \
+  || die "ClusterSecretStore CRD is not present. Re-run Step 3 with --set crds.enabled=true"
+```
+
+After:
+
+```bash
+kubectl wait --for=condition=established --timeout=120s \
+  crd/clustersecretstores.external-secrets.io \
+  || die "ClusterSecretStore CRD never became established. Inspect with: kubectl get crd | grep external-secrets"
+```
+
+Two things change:
+
+1. `kubectl wait` asks about the **CRD object**, which lives in
+   `apiextensions.k8s.io` — a core API group that is always cached and never
+   goes stale. It bypasses the bad cached entry entirely.
+2. It **waits** up to 120 seconds. A CRD takes a moment to become *established*
+   after being created; the old check sampled once, two seconds in, and gave up.
+
+**Lesson — two of them.**
+
+First: `kubectl` reads a cached picture of the cluster. When something installs
+new capabilities *mid-script*, that picture is behind. Never test for a
+freshly-installed CRD with `api-resources` or `get crd | grep`. Use:
+
+```bash
+kubectl wait --for=condition=established --timeout=120s crd/<name>
+```
+
+**This will recur in Step C.** ArgoCD installs CRDs for kube-prometheus-stack,
+ECK (Elasticsearch), Jaeger and OpenTelemetry. Anything that checks for them
+seconds later hits exactly this trap.
+
+Second: a guard written to clarify one failure became the next failure. The
+shape was right — it stopped loudly instead of creating a half-configured
+store — but a check that runs immediately after an install must **wait**, not
+sample.
+
+---
+
+## 14. `no such host` from every `kubectl` command after a rebuild
+
+**Symptom:** immediately after a destroy-and-reapply, every `kubectl` command
+fails:
+
+```
+E0901 19:17:57 "Unhandled Error" err="couldn't get current server API group list:
+Get \"https://F6629633B2FF2CB058E0A194B973F06C.gr7.eu-central-1.eks.amazonaws.com/api?timeout=32s\":
+dial tcp: lookup F6629633B2FF2CB058E0A194B973F06C.gr7.eu-central-1.eks.amazonaws.com: no such host"
+```
+
+**Cause:** the local kubeconfig still points at the **destroyed** cluster's API
+endpoint. Every EKS cluster gets a unique hostname, so a rebuild produces a new
+one and the old name no longer resolves in DNS.
+
+This is expected after every rebuild, not a fault. It looks alarming because it
+reads like a network failure.
+
+**Fix:**
+
+```bash
+aws eks update-kubeconfig --region eu-central-1 --name fraud-dev-cluster
+kubectl get nodes
+```
+
+**Check the cluster is actually ready first.** Running `update-kubeconfig`
+against a cluster still in `CREATING` writes an endpoint that does not serve
+yet:
+
+```bash
+aws eks describe-cluster --name fraud-dev-cluster --region eu-central-1 \
+  --query 'cluster.status' --output text
+```
+
+Wait for `ACTIVE`. Typically about 15 minutes from the start of the apply.
+
+**How to tell this apart from §8** (`You must be logged in to the server`):
+
+| Message | Meaning |
+|---|---|
+| `no such host` | kubeconfig points at a cluster that no longer exists — run `update-kubeconfig` |
+| `You must be logged in to the server` | Cluster exists and resolves, but your IAM identity has no access entry — see §8 |
+
+The first is DNS. The second is permissions. They are unrelated.
+
+**Side effect worth knowing:** the new endpoint also means a brand-new
+`kubectl` discovery cache directory with no history — which is one of the three
+conditions behind §13.
+
+---
+
 ## Still outstanding
 
 `fraud-github-actions-app-role` (used by `fraud-backend-CI`) was created by
@@ -634,13 +824,24 @@ It will fail exactly as sections 3–5 did. Two fixes needed before Part 3:
 8. **IRSA not working?** Read the ServiceAccount annotation before touching IAM.
 9. **Connection reset on port-forward?** `curl -I http://...` first. If curl
    works, the problem is the browser, not the cluster.
+10. **A CRD you just installed reported missing?** `kubectl`'s discovery cache
+    is stale. Use `kubectl wait --for=condition=established crd/<name>`, never
+    `api-resources` or `get crd | grep`.
+11. **`no such host` from kubectl?** The cluster was rebuilt. Run
+    `aws eks update-kubeconfig` — but check `describe-cluster` says `ACTIVE`
+    first.
 
 The recurring theme: **one generic error message can have several unrelated
 causes.** Get the actual data — CloudTrail, access entries, lock info,
 `api-resources`, the pod's own startup log — before changing anything.
 
-A second theme, new in sections 10–12: **the component will tell you its own
+A second theme, from sections 10–12: **the component will tell you its own
 state if you ask it.** `api-resources` names the served API version. The
 ServiceAccount shows the ARN it holds. `argocd-server` prints `tls:` in its
-first ten log lines. Three of tonight's errors were each two seconds of reading
-away.
+first ten log lines. Each of those errors was two seconds of reading away.
+
+A third theme, from sections 13–14: **the tooling caches, and the cache lies
+after a change.** `kubectl` caches what the cluster can do; the kubeconfig
+caches where the cluster lives. Both go stale the moment something is installed
+or rebuilt, and both then report absence rather than staleness. When a thing you
+just created is reported missing, suspect the cache before the thing.
