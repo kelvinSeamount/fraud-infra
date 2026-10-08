@@ -223,7 +223,7 @@ jobs:
         run: terraform init -backend-config=backend.tfvars
 
       - name: Download plan file
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: tfplan-${{ env.TARGET_ENV }}
           path: envs/${{ env.TARGET_ENV }}
