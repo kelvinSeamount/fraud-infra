@@ -77,7 +77,7 @@ jobs:
       # OIDC: GitHub mints a short-lived JWT, AWS validates it against the
       # provider and the sub-claim condition, and returns 1-hour STS creds.
       - name: Configure AWS credentials (OIDC)
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@v6
         with:
           role-to-assume: ${{ vars.AWS_TF_ROLE_ARN }}
           role-session-name: gha-terraform-${{ github.run_id }}
@@ -213,7 +213,7 @@ jobs:
           terraform_version: ${{ env.TF_VERSION }}
 
       - name: Configure AWS credentials (OIDC)
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@v6
         with:
           role-to-assume: ${{ vars.AWS_TF_ROLE_ARN }}
           role-session-name: gha-terraform-apply-${{ github.run_id }}
@@ -266,7 +266,7 @@ jobs:
           terraform_version: ${{ env.TF_VERSION }}
 
       - name: Configure AWS credentials (OIDC)
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@v6
         with:
           role-to-assume: ${{ vars.AWS_TF_ROLE_ARN }}
           role-session-name: gha-terraform-destroy-${{ github.run_id }}
