@@ -61,6 +61,7 @@ jobs:
   plan:
     name: Terraform Plan (${{ github.event.inputs.environment || 'dev' }})
     runs-on: ubuntu-latest
+    if: github.event.inputs.action != 'destroy'
     defaults:
       run:
         working-directory: envs/${{ github.event.inputs.environment || 'dev' }}
