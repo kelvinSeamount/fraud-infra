@@ -1,10 +1,7 @@
 name: Terraform Infrastructure
 
-# Push/PR to main touching envs/dev/** or modules/** -> plan (+apply on merge)
-# Manual dispatch -> choose environment (dev/qa/prod) and action
-#
-# AUTH: GitHub OIDC. No static AWS keys in this repo. The role ARN lives in the
-# repo variable AWS_TF_ROLE_ARN, created by scripts/00-bootstrap-github-oidc.sh
+# Push/PR to main on envs/dev/** or modules/** → auto plan+apply for dev
+# Manual dispatch → choose environment (dev / qa / prod) + action (plan / apply / destroy)
 
 on:
   push:
