@@ -47,8 +47,7 @@ env:
   AWS_REGION: eu-central-1
   TARGET_ENV: ${{ github.event.inputs.environment || 'dev' }}
 
-# Serialise runs per branch+env. Two concurrent applies against one state file
-# is the fastest way to corrupt it.
+# Prevent parallel runs on the same branch — avoids state conflicts
 concurrency:
   group: terraform-${{ github.ref }}-${{ github.event.inputs.environment || 'dev' }}
   cancel-in-progress: false
